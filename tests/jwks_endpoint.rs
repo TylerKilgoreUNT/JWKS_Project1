@@ -1,45 +1,62 @@
-use std::net::TcpListener;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use jwks_server_rust::app::{build_router, JWKS_PATH};
 use jwks_server_rust::keystore::KeyStore;
 
-use reqwest::Client;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
+use tower::ServiceExt;
 use serde_json::Value;
 
-async fn spawn_server() -> String {
-    let keystore = Arc::new(KeyStore::new());
-    let app = build_router(keystore);
+fn build_test_app() -> axum::Router {
+    static TEST_KEYSTORE: OnceLock<Arc<KeyStore>> = OnceLock::new();
+    let keystore = TEST_KEYSTORE
+        .get_or_init(|| Arc::new(KeyStore::new_with_bits(2048)))
+        .clone();
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind random port");
-    let addr = listener.local_addr().unwrap();
+    build_router(keystore)
+}
 
-    let tokio_listener = tokio::net::TcpListener::from_std(listener).unwrap();
-    let server = axum::serve(tokio_listener, app);
+async fn request_json(method: &str, uri: &str) -> (StatusCode, Value, String) {
+    let app = build_test_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
 
-    tokio::spawn(async move {
-        if let Err(e) = server.await {
-            eprintln!("server error: {e}");
-        }
-    });
+    let status = response.status();
+    let body_bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
 
-    format!("http://{}", addr)
+    let body_text = String::from_utf8_lossy(&body_bytes).to_string();
+    if body_text.trim().is_empty() {
+        return (status, Value::Null, body_text);
+    }
+
+    let value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => Value::Null,
+    };
+
+    (status, value, body_text)
 }
 
 #[tokio::test]
 async fn jwks_endpoint_returns_json_and_only_unexpired_keys() {
-    let base = spawn_server().await;
-    let client = Client::new();
+    let (status, body, body_text) = request_json("GET", JWKS_PATH).await;
+    assert_eq!(status, StatusCode::OK, "status: {status}, body: {body_text}");
 
-    let resp = client
-        .get(format!("{}{}", base, JWKS_PATH))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status().as_u16(), 200);
-
-    let body: Value = resp.json().await.unwrap();
     let keys = body["keys"].as_array().expect("JWKS should have a keys array");
 
     assert_eq!(keys.len(), 1);
@@ -52,4 +69,22 @@ async fn jwks_endpoint_returns_json_and_only_unexpired_keys() {
     assert!(k["kid"].as_str().unwrap().len() > 0);
     assert!(k["n"].as_str().unwrap().len() > 0);
     assert!(k["e"].as_str().unwrap().len() > 0);
+}
+
+#[tokio::test]
+async fn jwks_rejects_wrong_method() {
+    let app = build_test_app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(JWKS_PATH)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
 }

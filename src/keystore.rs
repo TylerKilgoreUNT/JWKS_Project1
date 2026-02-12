@@ -18,9 +18,10 @@ pub struct KeyStore {
 }
 
 impl KeyStore {
-    pub fn generate_key_record(expires_at: i64) -> KeyRecord {
+    pub fn generate_key_record(expires_at: i64, key_bits: usize) -> KeyRecord {
         let mut rng = OsRng;
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("RSA key generation failed");
+        let private_key = RsaPrivateKey::new(&mut rng, key_bits)
+            .expect("RSA key generation failed");
         let public_key = RsaPublicKey::from(&private_key);
         let kid = Uuid::new_v4().to_string();
 
@@ -33,9 +34,13 @@ impl KeyStore {
     }
 
     pub fn new() -> Self {
+        Self::new_with_bits(2048)
+    }
+
+    pub fn new_with_bits(key_bits: usize) -> Self {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let active = Self::generate_key_record(now + 3600);
-        let expired = Self::generate_key_record(now - 3600);
+        let active = Self::generate_key_record(now + 3600, key_bits);
+        let expired = Self::generate_key_record(now - 3600, key_bits);
 
         Self { active, expired }
     }
